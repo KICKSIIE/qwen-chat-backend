@@ -3,7 +3,7 @@ const nodemailer = require('nodemailer');
 const SMTP_USER = process.env.SMTP_USER;
 const SMTP_PASS = (process.env.SMTP_PASS || '').replace(/\s+/g, ''); // Google shows app passwords with spaces
 const SMTP_PORT = parseInt(process.env.SMTP_PORT || '465', 10);
-const APP_NAME = 'Qwen Chat';
+const APP_NAME = 'Chat bot';
 
 const transporter =
   SMTP_USER && SMTP_PASS
