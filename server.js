@@ -1,5 +1,10 @@
 /**
- * Chat backend: Express + PostgreSQL + Ollama (chat/vision) + Whisper (voice).
+ * CRUD backend: Express + PostgreSQL.
+ * Accounts, conversations, messages and photos are stored here.
+ *
+ * It does NOT run the AI. Replies come from the separate AI service (ai-service.js), which
+ * this server calls over HTTP using the OpenAI-style /v1 API. Voice goes to the Whisper server.
+ * Start both programs:  node ai-service.js   and   node server.js
  *
  * DATABASE EXPECTATIONS (run these once if you haven't already):
  *   -- Login/signup look users up by lower(email). A plain index on `email` is NOT used for that,
@@ -8,6 +13,10 @@
  *
  *   -- Deleting a conversation relies on its messages being removed with it:
  *   --   messages.conversation_id REFERENCES conversations(id) ON DELETE CASCADE
+ *
+ *   -- API keys: run api_keys.sql once to create the api_keys table.
+ *
+ *   -- AI replies: ai-service.js must be running, and AI_API_KEY must be the same key in both programs.
  *
  *   -- Optional: messages.image holds base64 text, which is ~33% bigger than raw bytes.
  *   -- A bytea column would save space (you'd store Buffer.from(b64, 'base64') and
@@ -37,10 +46,11 @@ if (!JWT_SECRET || JWT_SECRET.length < 32) {
 // key does not compromise the other. Falls back to JWT_SECRET so existing setups keep working.
 const CODE_SECRET = process.env.CODE_SECRET || JWT_SECRET;
 
-const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
-// NOTE: photos only work with a vision-capable model. A text-only model such as
-// qwen2.5:7b silently ignores the `images` field, so answers won't relate to the photo.
-const MODEL_NAME = process.env.MODEL_NAME || 'qwen2.5vl:7b';
+// Where the AI service lives. Locally that is ai-service.js on port 3001. To use an AI service
+// on another PC, set AI_BASE_URL to its address, e.g. https://xxxx.ngrok-free.dev/v1,
+// and AI_API_KEY to the key that service gave you.
+const AI_BASE_URL = (process.env.AI_BASE_URL || 'http://localhost:3001/v1').replace(/\/+$/, '');
+const AI_API_KEY = process.env.AI_API_KEY || '';
 const MAX_HISTORY_MESSAGES = parseInt(process.env.MAX_HISTORY_MESSAGES || '12', 10);
 const JWT_EXPIRES_IN = '7d';
 const SERPER_API_KEY = process.env.SERPER_API_KEY || '';
@@ -49,14 +59,16 @@ const MAX_IMAGE_B64_CHARS = 3000000; // about 2.2 MB of JPEG; the app downsizes 
 // it just sends an empty message and lets the server fill this in.
 const DEFAULT_PHOTO_PROMPT = 'What do you see in this photo?';
 
-const OLLAMA_NUM_CTX = 8192;
-const OLLAMA_NUM_PREDICT = 1024; // hard cap on reply length (in tokens)
-const OLLAMA_TEMPERATURE = 0.3;
-// Overall time limit for one generation. Kept below the app's 5 minute request timeout
-// so the server gives up (and reports an error) before the app does.
-const OLLAMA_TIMEOUT_MS = 4 * 60 * 1000;
+// Time limit for one AI call. Longer than the AI service's own limit (4 min),
+// shorter than the app's 5 minute request timeout, so we report an error before the app gives up.
+const AI_CALL_TIMEOUT_MS = 4.5 * 60 * 1000;
 const MAX_MESSAGE_CHARS = 4000;
 const MAX_TOTAL_CHARS = 16000; // total characters of history sent to the model
+
+// API keys let scripts and other tools call the backend without the app's login flow.
+// Keys look like "cb_..." (JWT tokens never start with that), and only a hash is stored.
+const API_KEY_PREFIX = 'cb_';
+const MAX_API_KEYS_PER_USER = 5;
 
 const CODE_TTL_MIN = 10;
 const CODE_MAX_ATTEMPTS = 5;
@@ -149,6 +161,9 @@ const USER_COLS = 'id, username, email, display_name, token_version';
 // Only these fields are ever sent to the app (never the password hash or token_version).
 const publicUser = (u) => ({ id: u.id, username: u.username, email: u.email, display_name: u.display_name });
 
+// API keys are long and random, so a plain SHA-256 is enough to store them safely.
+const hashApiKey = (key) => crypto.createHash('sha256').update(key).digest('hex');
+
 // `tv` (token version) lets us invalidate every old token by bumping the column in the DB.
 function signToken(user) {
   return jwt.sign({ userId: user.id, tv: user.token_version }, JWT_SECRET, {
@@ -220,6 +235,28 @@ async function requireAuth(req, res, next) {
   if (scheme !== 'Bearer' || !token) {
     return res.status(401).json({ error: 'Missing or malformed Authorization header' });
   }
+
+  // API key path: "Authorization: Bearer cb_..." works like a long-lived login for this user.
+  if (token.startsWith(API_KEY_PREFIX)) {
+    try {
+      const r = await pool.query(
+        `SELECT u.id, u.username, u.email, u.display_name, u.email_verified, k.id AS key_id
+           FROM api_keys k JOIN users u ON u.id = k.user_id
+          WHERE k.key_hash = $1 AND k.revoked_at IS NULL`,
+        [hashApiKey(token)]
+      );
+      const u = r.rows[0];
+      if (!u || !u.email_verified) return res.status(401).json({ error: 'Invalid API key' });
+      // Record when the key was last used (fire and forget; a failure here shouldn't block the request).
+      pool.query('UPDATE api_keys SET last_used_at = NOW() WHERE id = $1', [u.key_id]).catch(() => {});
+      req.user = publicUser(u);
+      req.viaApiKey = true;
+      return next();
+    } catch (err) {
+      return next(err);
+    }
+  }
+
   let payload;
   try {
     payload = jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] });
@@ -241,6 +278,16 @@ async function requireAuth(req, res, next) {
   } catch (err) {
     next(err);
   }
+}
+
+// Like requireAuth, but refuses API keys. Used for account changes, so a leaked key
+// can't change the password/email or create more keys. Only a real sign-in can.
+function requireSession(req, res, next) {
+  requireAuth(req, res, (err) => {
+    if (err) return next(err);
+    if (req.viaApiKey) return res.status(403).json({ error: 'Sign in with your password to do this. API keys are not allowed here.' });
+    next();
+  });
 }
 
 // Every conversation route uses this so users can only touch their own data.
@@ -502,7 +549,7 @@ app.get('/api/me', requireAuth, (req, res) => res.json({ user: req.user }));
 // ---------------------------------------------------------------------------
 app.post(
   '/api/account/request-code',
-  requireAuth,
+  requireSession,
   codeLimiter,
   ah(async (req, res) => {
     const { purpose } = req.body;
@@ -537,7 +584,7 @@ app.post(
 
 app.post(
   '/api/account/change-password',
-  requireAuth,
+  requireSession,
   codeLimiter,
   ah(async (req, res) => {
     checkCodeFormat(req.body.code);
@@ -550,6 +597,8 @@ app.post(
         WHERE id = $2 RETURNING ${USER_COLS}`,
       [hash, req.user.id]
     );
+    // API keys are credentials too, so a password change revokes them all.
+    await pool.query('UPDATE api_keys SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL', [req.user.id]);
     // New token keeps this device signed in; every other device is signed out.
     res.json({ token: signToken(u.rows[0]), user: publicUser(u.rows[0]) });
   })
@@ -557,7 +606,7 @@ app.post(
 
 app.post(
   '/api/account/change-email',
-  requireAuth,
+  requireSession,
   codeLimiter,
   ah(async (req, res) => {
     checkCodeFormat(req.body.code);
@@ -579,7 +628,7 @@ app.post(
 
 app.patch(
   '/api/account/username',
-  requireAuth,
+  requireSession,
   ah(async (req, res) => {
     const username = cleanUsername(req.body.username);
     const u = await pool.query(
@@ -587,6 +636,71 @@ app.patch(
       [username, req.user.id]
     );
     res.json({ user: publicUser(u.rows[0]) });
+  })
+);
+
+// ---------------------------------------------------------------------------
+// API keys (create / list / revoke). Sign-in required; API keys can't manage keys.
+// ---------------------------------------------------------------------------
+app.post(
+  '/api/account/api-keys',
+  requireSession,
+  codeLimiter,
+  ah(async (req, res) => {
+    const name = typeof req.body.name === 'string' ? req.body.name.trim().slice(0, 50) : '';
+    if (!name) throw httpError(400, 'Give the key a name');
+
+    // A key is a long-lived credential, so ask for the password first (like changing email).
+    const current = await pool.query('SELECT password_hash FROM users WHERE id = $1', [req.user.id]);
+    const pw = typeof req.body.currentPassword === 'string' ? req.body.currentPassword : '';
+    if (!pw || pw.length > 200 || !(await bcrypt.compare(pw, current.rows[0].password_hash))) {
+      throw httpError(403, 'Current password is incorrect');
+    }
+
+    const count = await pool.query(
+      'SELECT COUNT(*)::int AS n FROM api_keys WHERE user_id = $1 AND revoked_at IS NULL',
+      [req.user.id]
+    );
+    if (count.rows[0].n >= MAX_API_KEYS_PER_USER) {
+      throw httpError(400, `You can have up to ${MAX_API_KEYS_PER_USER} active keys. Revoke one first.`);
+    }
+
+    const key = API_KEY_PREFIX + crypto.randomBytes(32).toString('base64url');
+    const ins = await pool.query(
+      `INSERT INTO api_keys (user_id, name, key_hash, prefix) VALUES ($1, $2, $3, $4)
+       RETURNING id, name, prefix, created_at`,
+      [req.user.id, name, hashApiKey(key), key.slice(0, 10)]
+    );
+    // The full key is shown ONCE, here. Only its hash is stored, so it can't be shown again.
+    res.status(201).json({ apiKey: key, key: ins.rows[0] });
+  })
+);
+
+app.get(
+  '/api/account/api-keys',
+  requireSession,
+  ah(async (req, res) => {
+    const r = await pool.query(
+      `SELECT id, name, prefix, created_at, last_used_at FROM api_keys
+        WHERE user_id = $1 AND revoked_at IS NULL ORDER BY id DESC`,
+      [req.user.id]
+    );
+    res.json({ keys: r.rows });
+  })
+);
+
+app.delete(
+  '/api/account/api-keys/:id',
+  requireSession,
+  ah(async (req, res) => {
+    const id = parseId(req.params.id);
+    if (!id) throw httpError(404, 'Not found');
+    const r = await pool.query(
+      'UPDATE api_keys SET revoked_at = NOW() WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL RETURNING id',
+      [id, req.user.id]
+    );
+    if (r.rowCount === 0) throw httpError(404, 'Not found');
+    res.json({ revoked: id });
   })
 );
 
@@ -669,59 +783,70 @@ app.delete(
 // Chat (streaming SSE)
 // ---------------------------------------------------------------------------
 
-// Yields one parsed JSON object per line, buffering partial lines across network chunks.
-async function* ollamaStream(messages, signal) {
-  const r = await fetch(`${OLLAMA_URL}/api/chat`, {
+// Asks the AI service for a reply and yields { content, finish } for each streamed piece.
+// `finish` is null until the last piece, then "stop" or "length" (cut off by the token limit).
+// Photos are sent as JPEG data URLs, as the OpenAI-style API expects.
+async function* aiStream(messages, signal) {
+  const msgs = messages.map((m) =>
+    m.images && m.images.length
+      ? {
+          role: m.role,
+          content: [
+            { type: 'text', text: m.content },
+            ...m.images.map((b64) => ({ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${b64}` } })),
+          ],
+        }
+      : { role: m.role, content: m.content }
+  );
+
+  const r = await fetch(`${AI_BASE_URL}/chat/completions`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${AI_API_KEY}`,
+      'ngrok-skip-browser-warning': 'true', // harmless; needed if the AI service is behind a free ngrok URL
+    },
     signal,
-    body: JSON.stringify({
-      model: MODEL_NAME,
-      messages,
-      stream: true,
-      options: {
-        num_ctx: OLLAMA_NUM_CTX,
-        num_predict: OLLAMA_NUM_PREDICT,
-        temperature: OLLAMA_TEMPERATURE,
-        repeat_penalty: 1.1,
-      },
-    }),
+    body: JSON.stringify({ messages: msgs, stream: true }),
   });
   if (!r.ok) {
-    const body = await r.text().catch(() => '');
-    throw new Error(`Ollama responded ${r.status}: ${body.slice(0, 200)}`);
+    const text = await r.text().catch(() => '');
+    const err = new Error(`AI service responded ${r.status}: ${text.slice(0, 200)}`);
+    // Only "busy" is safe to show to the user; other failures (like a wrong key) are logged only.
+    if (r.status === 429) {
+      try {
+        err.aiMessage = JSON.parse(text).error.message;
+      } catch {}
+    }
+    throw err;
   }
 
   const decoder = new TextDecoder(); // stream mode keeps multi-byte characters intact across chunks
   let buf = '';
-  const parse = (line) => {
-    try {
-      return JSON.parse(line);
-    } catch {
-      return null;
-    }
-  };
-
   for await (const chunk of r.body) {
     buf += decoder.decode(chunk, { stream: true });
-    let nl;
-    while ((nl = buf.indexOf('\n')) >= 0) {
-      const line = buf.slice(0, nl).trim();
-      buf = buf.slice(nl + 1);
-      if (!line) continue;
-      const parsed = parse(line);
-      if (!parsed) continue;
-      if (parsed.error) throw new Error(parsed.error);
-      yield parsed;
-    }
-  }
-  // Whatever is left after the stream ends (a final line with no trailing newline).
-  const tail = (buf + decoder.decode()).trim();
-  if (tail) {
-    const parsed = parse(tail);
-    if (parsed) {
-      if (parsed.error) throw new Error(parsed.error);
-      yield parsed;
+    // Events are separated by a blank line; keep any unfinished tail until the rest arrives.
+    let idx;
+    while ((idx = buf.indexOf('\n\n')) >= 0) {
+      const evt = buf.slice(0, idx).trim();
+      buf = buf.slice(idx + 2);
+      if (!evt.startsWith('data:')) continue;
+      const data = evt.slice(5).trim();
+      if (data === '[DONE]') return;
+      let parsed;
+      try {
+        parsed = JSON.parse(data);
+      } catch {
+        continue; // malformed event; skip it
+      }
+      if (parsed.error) {
+        // The AI service reports its own problems in plain words (e.g. repetition), safe to show.
+        const err = new Error(parsed.error.message || 'AI service error');
+        err.aiMessage = parsed.error.message;
+        throw err;
+      }
+      const choice = parsed.choices && parsed.choices[0];
+      yield { content: (choice && choice.delta && choice.delta.content) || '', finish: (choice && choice.finish_reason) || null };
     }
   }
 }
@@ -769,19 +894,6 @@ function formatSearchBlock(query, sources) {
     'Use them for up-to-date facts.\n' +
     sources.map((s, i) => `${i + 1}. ${s.title} (${s.host}): ${s.snippet}`).join('\n')
   );
-}
-
-// Loop detectors for small models that sometimes repeat themselves forever.
-// 1) the last 200 characters already appeared earlier in the reply.
-function tailRepeats(text) {
-  const tail = text.slice(-200);
-  return text.slice(0, -200).includes(tail);
-}
-
-// 2) very few distinct words compared with the total word count.
-function looksLikeLoop(text) {
-  const words = text.toLowerCase().split(/\s+/);
-  return words.length > 50 && new Set(words).size / words.length < 0.15;
 }
 
 // Order matters: sign-in check first, THEN the rate limit, THEN the big body parser.
@@ -906,52 +1018,44 @@ app.post(
       if (!clientGone && !res.writableEnded) res.write(`data: ${JSON.stringify(obj)}\n\n`);
     };
 
-    // Runs one generation, streaming pieces to the app as they arrive.
-    // Returns the text plus flags: `repeated` (stopped for looping) and
-    // `truncated` (hit the OLLAMA_NUM_PREDICT limit).
+    // Gets one reply from the AI service, streaming pieces to the app as they arrive.
+    // Returns the text and whether the reply was cut off by the token limit.
     async function generate(msgs) {
       current = new AbortController();
       let timedOut = false;
-      // Overall time limit, so a hung Ollama can't keep this request open forever.
+      // Overall time limit, so a hung AI service can't keep this request open forever.
       const timer = setTimeout(() => {
         timedOut = true;
         current.abort();
-      }, OLLAMA_TIMEOUT_MS);
+      }, AI_CALL_TIMEOUT_MS);
 
       let reply = '';
-      let lastCheck = 0;
-      let repeated = false;
       let truncated = false;
+      let finished = false;
       try {
-        for await (const p of ollamaStream(msgs, current.signal)) {
-          // The final chunk has no text but says why generation ended.
-          // "length" means the model was cut off by the token limit.
-          if (p.done && p.done_reason === 'length') truncated = true;
-          const piece = p.message?.content || '';
-          if (!piece) continue;
-          reply += piece;
-          send({ content: piece });
-          // Check for loops every ~100 new characters, not on every token.
-          if (reply.length > 800 && reply.length - lastCheck >= 100) {
-            lastCheck = reply.length;
-            if (tailRepeats(reply)) {
-              repeated = true;
-              break;
-            }
+        for await (const p of aiStream(msgs, current.signal)) {
+          if (p.finish) {
+            finished = true;
+            if (p.finish === 'length') truncated = true;
           }
+          if (!p.content) continue;
+          reply += p.content;
+          send({ content: p.content });
         }
+        // The stream ended without a finish marker: the connection was cut mid-reply.
+        if (!finished) throw new Error('AI stream ended early');
       } catch (err) {
-        // An abort caused by the client pressing Stop is not an error: return what we have.
+        // An abort because the client pressed Stop is not an error: return what we have.
         if (err.name !== 'AbortError') throw err;
         // An abort caused by our own timer IS an error.
-        if (timedOut) throw new Error('Ollama timed out');
+        if (timedOut) throw new Error('AI service timed out');
       } finally {
         clearTimeout(timer);
         try {
-          current.abort(); // makes sure the connection to Ollama is closed
+          current.abort(); // makes sure the connection to the AI service is closed
         } catch {}
       }
-      return { reply, repeated, truncated };
+      return { reply, truncated };
     }
 
     let sources = [];
@@ -976,9 +1080,9 @@ app.post(
 
       result = await generate(history);
 
-      if (!clientGone && !result.repeated && result.reply.trim() === '') {
+      if (!clientGone && result.reply.trim() === '') {
         // Retry once with a minimal prompt so a poisoned history can't block simple messages.
-        console.error('[ollama] empty reply, retrying with minimal history');
+        console.error('[ai] empty reply, retrying with minimal history');
         result = await generate([
           systemMessage,
           { role: 'user', content: userContent, ...(image ? { images: [image] } : {}) },
@@ -987,13 +1091,7 @@ app.post(
 
       // Client still connected: normal completion path.
       if (!clientGone) {
-        if (result.repeated || looksLikeLoop(result.reply)) {
-          // The user has already SEEN the streamed text, but we don't save it, so it will
-          // be gone after a reload. That is intentional: we don't want looping text in history.
-          console.error('[ollama] repetition detected, reply not saved');
-          send({ error: 'Generation stopped (repetition detected)' });
-          result = null; // nothing worth saving
-        } else if (result.reply.trim() === '') {
+        if (result.reply.trim() === '') {
           send({ error: 'Model returned no response' });
           result = null;
         } else {
@@ -1019,14 +1117,16 @@ app.post(
     } catch (err) {
       if (!clientGone) {
         console.error('[chat]', err.message);
-        send({ error: 'The model failed to respond. Try again.' });
+        // If the AI service stopped the reply (e.g. repetition), the text already streamed to the
+        // app is NOT saved, so it is gone after a reload. That is intentional.
+        send({ error: err.aiMessage || 'The model failed to respond. Try again.' });
       }
     } finally {
       // Client disconnected mid-stream (user tapped Stop): keep whatever streamed in,
       // marked as interrupted, so a reload shows the partial reply instead of nothing.
       if (!saved && clientGone && result) {
         const partial = result.reply.trim();
-        if (partial && !result.repeated && !looksLikeLoop(partial)) {
+        if (partial) {
           try {
             await pool.query(
               `INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'assistant', $2)`,
@@ -1112,8 +1212,8 @@ cleanup();
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Chat backend running on http://localhost:${PORT}`);
-  console.log(`Forwarding to Ollama at ${OLLAMA_URL} using model ${MODEL_NAME}`);
-  console.log(`  num_ctx=${OLLAMA_NUM_CTX} num_predict=${OLLAMA_NUM_PREDICT}`);
+  console.log(`AI service: ${AI_BASE_URL}`);
   console.log(`PostgreSQL ${process.env.PGHOST || 'localhost'}:${process.env.PGPORT || 5432}/${process.env.PGDATABASE || 'chat_app'}`);
   if (!process.env.SMTP_USER) console.log('SMTP not configured: verification codes will be printed here.');
+  if (!AI_API_KEY) console.log('WARNING: AI_API_KEY is not set. Chat replies will fail until you set it (same key as the AI service).');
 });

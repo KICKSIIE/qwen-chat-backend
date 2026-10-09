@@ -1,20 +1,24 @@
 const nodemailer = require('nodemailer');
 
+// Mail settings come from .env
 const SMTP_USER = process.env.SMTP_USER;
 const SMTP_PASS = (process.env.SMTP_PASS || '').replace(/\s+/g, ''); // Google shows app passwords with spaces
 const SMTP_PORT = parseInt(process.env.SMTP_PORT || '465', 10);
-const APP_NAME = 'Chat bot';
+const APP_NAME = process.env.AI_NAME || 'MashfyAI'; // shown in the email subject and sender name
 
+// Only create the mail connection if a login is set. Without it, the codes are printed
+// to the server console instead (see sendCodeEmail).
 const transporter =
   SMTP_USER && SMTP_PASS
     ? nodemailer.createTransport({
         host: process.env.SMTP_HOST || 'smtp.gmail.com',
         port: SMTP_PORT,
-        secure: SMTP_PORT === 465,
+        secure: SMTP_PORT === 465, // port 465 uses SSL from the start; other ports (like 587) upgrade after connecting
         auth: { user: SMTP_USER, pass: SMTP_PASS },
       })
     : null;
 
+// Subject and first line of the email for each kind of code
 const COPY = {
   verify_email: {
     subject: `Verify your email for ${APP_NAME}`,
@@ -30,22 +34,27 @@ const COPY = {
   },
 };
 
+// Sends a one-time code. Throws if sending fails (the server then tells the user to retry).
 async function sendCodeEmail(to, code, purpose, ttlMinutes) {
   const copy = COPY[purpose];
   if (!copy) throw new Error(`Unknown email purpose: ${purpose}`);
 
+  // No mail login configured
   if (!transporter) {
     if (process.env.NODE_ENV === 'production') {
       throw new Error('SMTP is not configured (set SMTP_USER and SMTP_PASS)');
     }
+    // Dev only: print the code so you can test without real email
     console.log(`[mail:dev] ${purpose} code for ${to}: ${code}`);
     return;
   }
 
+  // Plain-text version (for mail apps that don't show HTML)
   const text =
     `${copy.intro}\n\nYour code: ${code}\n\n` +
     `It expires in ${ttlMinutes} minutes. If you didn't ask for this, you can ignore this email.`;
 
+  // HTML version with a big, easy-to-read code
   const html =
     `<div style="font-family:-apple-system,Segoe UI,Roboto,sans-serif;max-width:420px">` +
     `<p>${copy.intro}</p>` +
